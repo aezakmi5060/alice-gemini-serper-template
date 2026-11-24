@@ -1,10 +1,10 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const DEFAULT_MODEL = "gpt-4.1-mini";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const OPENAI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -110,77 +110,76 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
+async function askOpenAI(text, history, searchContext, timeoutMs) {
+  const key = process.env.OPENAI_API_KEY?.trim();
+  if (!key) throw new Error("MISSING_OPENAI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
 
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
-  const contents = safeHistory(history).map(item => ({
-    role: item.role,
-    parts: [{ text: item.text }]
+  const model = process.env.OPENAI_MODEL?.trim() || DEFAULT_MODEL;
+  const input = safeHistory(history).map(item => ({
+    role: item.role === "model" ? "assistant" : "user",
+    content: item.text
   }));
 
   const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их как справочные данные по вопросу.`
     : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  input.push({ role: "user", content: prompt });
 
   const { response, data } = await fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    "https://api.openai.com/v1/responses",
     {
       method: "POST",
       headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": key
+        "Authorization": `Bearer ${key}`,
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-        contents,
-        generationConfig: {
-          temperature: 0.5,
-          maxOutputTokens: 240
-        }
+        model,
+        instructions: SYSTEM_PROMPT,
+        input,
+        max_output_tokens: 240,
+        store: false
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(OPENAI_TIMEOUT_MS, timeoutMs)
   );
 
   if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    const status = response.status;
+    const code = data?.error?.code;
+    console.error("OpenAI request failed with HTTP", status, code);
+    if (code === "model_not_found") throw new Error("OPENAI_MODEL_UNAVAILABLE");
+    if (status === 401 || status === 403) throw new Error("OPENAI_ACCESS_DENIED");
+    if (status === 429) throw new Error("OPENAI_QUOTA");
+    throw new Error("OPENAI_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
+  const content = (data.output || [])
+    .filter(item => item.type === "message")
+    .flatMap(item => item.content || []);
+  const answer = content
+    .filter(part => part.type === "output_text")
+    .map(part => part.text)
+    .join(" ")
     .trim();
 
-  if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
-  }
-  if (candidate?.finishReason === "MAX_TOKENS") {
-    console.warn("Gemini reached the output token limit.");
-  }
-  return answer;
+  if (answer) return answer;
+  if (content.some(part => part.type === "refusal")) throw new Error("OPENAI_BLOCKED");
+  throw new Error("OPENAI_EMPTY_RESPONSE");
 }
 
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
+    case "MISSING_OPENAI_KEY":
+      return "Сервер пока не настроен. Проверьте переменную OPENAI_API_KEY в настройках Vercel.";
+    case "OPENAI_ACCESS_DENIED":
+      return "Не удалось подключиться к OpenAI. Проверьте API-ключ и доступ к OpenAI.";
+    case "OPENAI_QUOTA":
+      return "Сейчас превышен лимит запросов к OpenAI. Проверьте баланс API или попробуйте позже.";
+    case "OPENAI_MODEL_UNAVAILABLE":
+      return "Модель OpenAI недоступна. Проверьте настройку OPENAI_MODEL в Vercel."
+    case "OPENAI_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
@@ -194,7 +193,7 @@ export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-openai-serper",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -225,11 +224,11 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askOpenAI(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(OPENAI_TIMEOUT_MS, remainingMs() - 600))
     );
 
     const history = [
@@ -240,7 +239,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.name === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
